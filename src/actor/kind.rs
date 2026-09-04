@@ -8,13 +8,14 @@ use std::{
 };
 
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
+use tokio::sync::MutexGuard;
 #[cfg(feature = "tracing")]
 use tracing::Instrument;
 
 use crate::{
     actor::{Actor, ActorRef, WeakActorRef},
     error::{ActorStopReason, PanicError, PanicReason},
-    links::{BoxMailboxReceiver, Link, ShutdownFn},
+    links::{BoxMailboxReceiver, Link, LinksInner, ShutdownFn},
     mailbox::{MailboxReceiver, Signal},
     message::{BoxMessage, CallbackFn, Context},
     reply::BoxReplySender,
@@ -244,155 +245,17 @@ where
         {
             let links = self.actor_ref.links.lock().await;
 
-            // Check if we're already coordinating a restart
-            if let CoordinationState::Coordinating {
-                waiting_for,
-                pending_mailboxes,
-            } = &mut self.coordination
-                && waiting_for.remove(&id)
-            {
-                let mailbox_rx =
-                    mailbox_rx.expect("mailbox receiver should be sent - this is a bug");
-                pending_mailboxes.insert(id, mailbox_rx);
-
-                if waiting_for.is_empty() {
-                    let mailboxes = mem::take(pending_mailboxes);
-                    self.coordination = CoordinationState::Idle;
-                    for (child_id, rx) in mailboxes {
-                        let spec = links.children.get(&child_id).unwrap();
-                        (spec.factory)(rx).await;
-                    }
-                }
-                return ControlFlow::Continue(());
-            }
-
-            if let Some(spec) = links.children.get(&id) {
-                let should_restart = spec.should_restart(&reason);
-                let factory = Arc::clone(&spec.factory);
-                #[cfg(feature = "tracing")]
-                let restart_count = spec.restart_tracker.current_count();
-
-                // Extract what we need for coordination before borrowing children again
-                let strategy_info = match should_restart {
-                    ControlFlow::Continue(()) => match A::supervision_strategy() {
-                        SupervisionStrategy::OneForOne => None,
-                        SupervisionStrategy::OneForAll => {
-                            let others: Vec<(ActorId, Arc<ShutdownFn>)> = links
-                                .children
-                                .iter()
-                                .filter(|(child_id, _)| *child_id != &id)
-                                .map(|(child_id, child_spec)| {
-                                    (*child_id, Arc::clone(&child_spec.shutdown))
-                                })
-                                .collect();
-                            Some(others)
-                        }
-                        SupervisionStrategy::RestForOne => {
-                            let others: Vec<(ActorId, Arc<ShutdownFn>)> = links
-                                .children
-                                .iter()
-                                .filter(|(child_id, _)| *child_id > &id)
-                                .map(|(child_id, child_spec)| {
-                                    (*child_id, Arc::clone(&child_spec.shutdown))
-                                })
-                                .collect();
-                            Some(others)
-                        }
-                    },
-                    ControlFlow::Break(_) => None,
-                };
-
-                match should_restart {
-                    ControlFlow::Continue(()) => {
-                        let mailbox_rx =
-                            mailbox_rx.expect("mailbox receiver should be sent - this is a bug");
-
-                        match strategy_info {
-                            None => {
-                                // OneForOne
-                                #[cfg(feature = "tracing")]
-                                tracing::debug!(
-                                    %id,
-                                    name = A::name(),
-                                    ?reason,
-                                    restart_count,
-                                    "actor restarting"
-                                );
-                                factory(mailbox_rx).await;
-                            }
-                            Some(others) if others.is_empty() => {
-                                // OneForAll/RestForOne but no other children
-                                factory(mailbox_rx).await;
-                            }
-                            Some(others) => {
-                                // OneForAll/RestForOne with other children to coordinate
-                                let mut waiting_for = HashSet::new();
-                                let mut pending_mailboxes = HashMap::new();
-
-                                pending_mailboxes.insert(id, mailbox_rx);
-
-                                for (child_id, shutdown) in others {
-                                    waiting_for.insert(child_id);
-                                    tokio::spawn(shutdown());
-                                }
-
-                                self.coordination = CoordinationState::Coordinating {
-                                    waiting_for,
-                                    pending_mailboxes,
-                                };
-                            }
-                        }
-
-                        return ControlFlow::Continue(());
-                    }
-                    #[cfg_attr(not(feature = "tracing"), allow(unused_variables))]
-                    ControlFlow::Break(no_restart_reason) => {
-                        #[cfg(feature = "tracing")]
-                        match no_restart_reason {
-                            crate::links::NoRestartReason::NormalExitUnderTransientPolicy => {
-                                tracing::debug!(
-                                    %id,
-                                    name = A::name(),
-                                    ?reason,
-                                    decision = %no_restart_reason,
-                                    "actor not restarted"
-                                );
-                            }
-                            crate::links::NoRestartReason::MaxRestartsExceeded { .. } => {
-                                tracing::warn!(
-                                    %id,
-                                    name = A::name(),
-                                    ?reason,
-                                    decision = %no_restart_reason,
-                                    "actor not restarted"
-                                );
-                            }
-                            crate::links::NoRestartReason::NeverPolicy => {
-                                tracing::debug!(
-                                    %id,
-                                    name = A::name(),
-                                    ?reason,
-                                    decision = %no_restart_reason,
-                                    "actor not restarted"
-                                );
-                            }
-                        }
-                        // Notify the dead child's own peer links
-                        if let Some(sibblings) = dead_actor_sibblings {
-                            let mut notify_futs: FuturesUnordered<_> = sibblings
-                                .into_iter()
-                                .map(|(sibbling_actor_id, link)| {
-                                    link.notify(sibbling_actor_id, id, reason.clone(), None, None)
-                                        .boxed()
-                                })
-                                .collect();
-                            tokio::spawn(async move {
-                                while let Some(()) = notify_futs.next().await {}
-                            });
-                        }
-                    }
-                }
-            }
+            handle_link_died_coordination(
+                id,
+                &reason,
+                dead_actor_sibblings,
+                links,
+                mailbox_rx,
+                &mut self.coordination,
+                A::supervision_strategy(),
+                A::name(),
+            )
+            .await?;
         }
 
         let res = AssertUnwindSafe(self.state.on_link_died(
@@ -463,4 +326,161 @@ where
     pub(crate) async fn shutdown(self) -> A {
         self.state
     }
+}
+
+#[inline]
+async fn handle_link_died_coordination(
+    id: ActorId,
+    reason: &ActorStopReason,
+    dead_actor_sibblings: Option<HashMap<ActorId, Link>>,
+    links: MutexGuard<'_, LinksInner>,
+    mailbox_rx: Option<Box<dyn Any + Send>>,
+    coordination: &mut CoordinationState,
+    supervision_strategy: SupervisionStrategy,
+    #[allow(unused)] actor_name: &'static str,
+) -> ControlFlow<ActorStopReason> {
+    // Check if we're already coordinating a restart
+    if let CoordinationState::Coordinating {
+        waiting_for,
+        pending_mailboxes,
+    } = coordination
+        && waiting_for.remove(&id)
+    {
+        let mailbox_rx = mailbox_rx.expect("mailbox receiver should be sent - this is a bug");
+        pending_mailboxes.insert(id, mailbox_rx);
+
+        if waiting_for.is_empty() {
+            let mailboxes = mem::take(pending_mailboxes);
+            *coordination = CoordinationState::Idle;
+            for (child_id, rx) in mailboxes {
+                let spec = links.children.get(&child_id).unwrap();
+                (spec.factory)(rx).await;
+            }
+        }
+        return ControlFlow::Continue(());
+    }
+
+    if let Some(spec) = links.children.get(&id) {
+        let should_restart = spec.should_restart(&reason);
+        let factory = Arc::clone(&spec.factory);
+        #[cfg(feature = "tracing")]
+        let restart_count = spec.restart_tracker.current_count();
+
+        // Extract what we need for coordination before borrowing children again
+        let strategy_info = match should_restart {
+            ControlFlow::Continue(()) => match supervision_strategy {
+                SupervisionStrategy::OneForOne => None,
+                SupervisionStrategy::OneForAll => {
+                    let others: Vec<(ActorId, Arc<ShutdownFn>)> = links
+                        .children
+                        .iter()
+                        .filter(|(child_id, _)| *child_id != &id)
+                        .map(|(child_id, child_spec)| (*child_id, Arc::clone(&child_spec.shutdown)))
+                        .collect();
+                    Some(others)
+                }
+                SupervisionStrategy::RestForOne => {
+                    let others: Vec<(ActorId, Arc<ShutdownFn>)> = links
+                        .children
+                        .iter()
+                        .filter(|(child_id, _)| *child_id > &id)
+                        .map(|(child_id, child_spec)| (*child_id, Arc::clone(&child_spec.shutdown)))
+                        .collect();
+                    Some(others)
+                }
+            },
+            ControlFlow::Break(_) => None,
+        };
+
+        match should_restart {
+            ControlFlow::Continue(()) => {
+                let mailbox_rx =
+                    mailbox_rx.expect("mailbox receiver should be sent - this is a bug");
+
+                match strategy_info {
+                    None => {
+                        // OneForOne
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!(
+                            %id,
+                            name = actor_name,
+                            ?reason,
+                            restart_count,
+                            "actor restarting"
+                        );
+                        factory(mailbox_rx).await;
+                    }
+                    Some(others) if others.is_empty() => {
+                        // OneForAll/RestForOne but no other children
+                        factory(mailbox_rx).await;
+                    }
+                    Some(others) => {
+                        // OneForAll/RestForOne with other children to coordinate
+                        let mut waiting_for = HashSet::new();
+                        let mut pending_mailboxes = HashMap::new();
+
+                        pending_mailboxes.insert(id, mailbox_rx);
+
+                        for (child_id, shutdown) in others {
+                            waiting_for.insert(child_id);
+                            tokio::spawn(shutdown());
+                        }
+
+                        *coordination = CoordinationState::Coordinating {
+                            waiting_for,
+                            pending_mailboxes,
+                        };
+                    }
+                }
+
+                return ControlFlow::Continue(());
+            }
+            #[cfg_attr(not(feature = "tracing"), allow(unused_variables))]
+            ControlFlow::Break(no_restart_reason) => {
+                #[cfg(feature = "tracing")]
+                match no_restart_reason {
+                    crate::links::NoRestartReason::NormalExitUnderTransientPolicy => {
+                        tracing::debug!(
+                            %id,
+                            name = actor_name,
+                            ?reason,
+                            decision = %no_restart_reason,
+                            "actor not restarted"
+                        );
+                    }
+                    crate::links::NoRestartReason::MaxRestartsExceeded { .. } => {
+                        tracing::warn!(
+                            %id,
+                            name = actor_name,
+                            ?reason,
+                            decision = %no_restart_reason,
+                            "actor not restarted"
+                        );
+                    }
+                    crate::links::NoRestartReason::NeverPolicy => {
+                        tracing::debug!(
+                            %id,
+                            name = actor_name,
+                            ?reason,
+                            decision = %no_restart_reason,
+                            "actor not restarted"
+                        );
+                    }
+                }
+                // Notify the dead child's own peer links
+                if let Some(sibblings) = dead_actor_sibblings {
+                    let mut notify_futs: FuturesUnordered<_> = sibblings
+                        .into_iter()
+                        .map(|(sibbling_actor_id, link)| {
+                            link.notify(sibbling_actor_id, id, reason.clone(), None, None)
+                                .boxed()
+                        })
+                        .collect();
+                    tokio::spawn(async move { while let Some(()) = notify_futs.next().await {} });
+                }
+            }
+        }
+    }
+
+    ControlFlow::Continue(())
 }

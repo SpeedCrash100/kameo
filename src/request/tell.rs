@@ -1,18 +1,67 @@
 use std::{future::IntoFuture, time::Duration};
 
 use futures::{FutureExt, future::BoxFuture};
-use tokio::task::JoinHandle;
+use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
     Actor,
     actor::{ActorRef, Recipient, ReplyRecipient},
     error::SendError,
     mailbox::Signal,
-    message::Message,
+    message::{BoxMessage, Message},
     reply::ReplyError,
 };
 
 use super::{WithRequestTimeout, WithoutRequestTimeout};
+
+async fn _send_tell<A>(
+    actor_ref: &ActorRef<A>,
+    message: BoxMessage<A>,
+    message_name: &'static str,
+    timeout: Option<Duration>,
+    #[cfg(all(debug_assertions, feature = "tracing"))] called_at: &'static std::panic::Location<
+        'static,
+    >,
+) -> Result<(), mpsc::error::SendTimeoutError<Signal<A>>>
+where
+    A: Actor,
+{
+    let signal = Signal::Message {
+        message: message,
+        actor_ref: actor_ref.clone(),
+        reply: None,
+        sent_within_actor: actor_ref.is_current(),
+        message_name: message_name,
+        #[cfg(feature = "tracing")]
+        caller_span: tracing::Span::current(),
+    };
+
+    let tx = actor_ref.mailbox_sender();
+    if tx.capacity().is_some() {
+        #[cfg(all(debug_assertions, feature = "tracing"))]
+        warn_deadlock(
+            actor_ref,
+            "An actor is sending a `tell` request to itself using a bounded mailbox, which may lead to a deadlock. To avoid this, use `.try_send()`.",
+            called_at,
+        );
+    }
+
+    // A bounded `tell` parks the sender until the mailbox has room; record that as a
+    // wait-for edge so the console can surface mailbox-capacity deadlocks. An unbounded
+    // send never waits, so it's left uninstrumented.
+    #[cfg(feature = "console")]
+    let _wait = tx.capacity().is_some().then(|| {
+        crate::console::registry::begin_wait(actor_ref.id(), crate::console::wire::WaitKind::Tell)
+    });
+
+    match timeout {
+        Some(timeout) => Ok(tx.send_timeout(signal, timeout).await?),
+        None => Ok(tx
+            .send(signal)
+            .await
+            .map_err(|e| mpsc::error::SendTimeoutError::Closed(e.0))?),
+    }
+}
 
 /// A request to send a message to an actor without any reply.
 ///
@@ -81,41 +130,16 @@ where
     where
         Tm: Into<Option<Duration>>,
     {
-        let signal = Signal::Message {
-            message: Box::new(self.msg),
-            actor_ref: self.actor_ref.clone(),
-            reply: None,
-            sent_within_actor: self.actor_ref.is_current(),
-            message_name: self.message_name,
-            #[cfg(feature = "tracing")]
-            caller_span: tracing::Span::current(),
-        };
-
-        let tx = self.actor_ref.mailbox_sender();
-        if tx.capacity().is_some() {
+        _send_tell(
+            self.actor_ref,
+            Box::new(self.msg),
+            self.message_name,
+            self.mailbox_timeout.into(),
             #[cfg(all(debug_assertions, feature = "tracing"))]
-            warn_deadlock(
-                self.actor_ref,
-                "An actor is sending a `tell` request to itself using a bounded mailbox, which may lead to a deadlock. To avoid this, use `.try_send()`.",
-                self.called_at,
-            );
-        }
-
-        // A bounded `tell` parks the sender until the mailbox has room; record that as a
-        // wait-for edge so the console can surface mailbox-capacity deadlocks. An unbounded
-        // send never waits, so it's left uninstrumented.
-        #[cfg(feature = "console")]
-        let _wait = tx.capacity().is_some().then(|| {
-            crate::console::registry::begin_wait(
-                self.actor_ref.id(),
-                crate::console::wire::WaitKind::Tell,
-            )
-        });
-
-        match self.mailbox_timeout.into() {
-            Some(timeout) => Ok(tx.send_timeout(signal, timeout).await?),
-            None => Ok(tx.send(signal).await?),
-        }
+            self.called_at,
+        )
+        .await
+        .map_err(|e| e.into())
     }
 
     /// Sends a message to the actor after a delay.

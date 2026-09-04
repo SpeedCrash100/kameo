@@ -1,5 +1,6 @@
 use futures::{FutureExt, future::BoxFuture};
 use std::{
+    any::Any,
     future::{Future, IntoFuture},
     pin, task,
     time::Duration,
@@ -14,11 +15,56 @@ use crate::{
     actor::{ActorRef, ReplyRecipient},
     error::{self, SendError},
     mailbox::Signal,
-    message::Message,
+    message::{BoxMessage, Message},
     reply::{ReplyError, ReplySender},
 };
 
 use super::{WithRequestTimeout, WithoutRequestTimeout};
+
+async fn _send_ask<A>(
+    actor_ref: &ActorRef<A>,
+    message: BoxMessage<A>,
+    message_name: &'static str,
+    mailbox_timeout: Option<Duration>,
+    reply_timeout: Option<Duration>,
+) -> Result<Box<dyn Any + Send>, SendError<Box<dyn Any + Send>, Box<dyn Any + Send>>>
+where
+    A: Actor,
+{
+    let (reply, rx) = oneshot::channel();
+
+    let signal = Signal::Message {
+        message: message,
+        actor_ref: actor_ref.clone(),
+        reply: Some(reply),
+        sent_within_actor: actor_ref.is_current(),
+        message_name: message_name,
+        #[cfg(feature = "tracing")]
+        caller_span: tracing::Span::current(),
+    };
+
+    let tx = actor_ref.mailbox_sender();
+    match mailbox_timeout {
+        Some(timeout) => {
+            tx.send_timeout(signal, timeout).await?;
+        }
+        None => {
+            tx.send(signal).await?;
+        }
+    }
+
+    #[cfg(feature = "console")]
+    let _wait =
+        crate::console::registry::begin_wait(actor_ref.id(), crate::console::wire::WaitKind::Ask);
+
+    let reply_timeout = reply_timeout.or_else(|| actor_ref.default_reply_timeout());
+    let reply = match reply_timeout {
+        Some(timeout) => tokio::time::timeout(timeout, rx).await??,
+        None => rx.await?,
+    };
+
+    reply
+}
 
 /// A request to send a message to an actor, waiting for a reply.
 #[allow(missing_debug_implementations)]
@@ -122,40 +168,15 @@ where
             self.called_at,
         );
 
-        let (reply, rx) = oneshot::channel();
-        let signal = Signal::Message {
-            message: Box::new(self.msg),
-            actor_ref: self.actor_ref.clone(),
-            reply: Some(reply),
-            sent_within_actor: self.actor_ref.is_current(),
-            message_name: self.message_name,
-            #[cfg(feature = "tracing")]
-            caller_span: tracing::Span::current(),
-        };
+        let reply = _send_ask(
+            &self.actor_ref,
+            Box::new(self.msg),
+            self.message_name,
+            self.mailbox_timeout.into(),
+            self.reply_timeout.into(),
+        )
+        .await;
 
-        let tx = self.actor_ref.mailbox_sender();
-        match self.mailbox_timeout.into() {
-            Some(timeout) => {
-                tx.send_timeout(signal, timeout).await?;
-            }
-            None => {
-                tx.send(signal).await?;
-            }
-        }
-
-        #[cfg(feature = "console")]
-        let _wait = crate::console::registry::begin_wait(
-            self.actor_ref.id(),
-            crate::console::wire::WaitKind::Ask,
-        );
-        let reply_timeout = self
-            .reply_timeout
-            .into()
-            .or_else(|| self.actor_ref.default_reply_timeout());
-        let reply = match reply_timeout {
-            Some(timeout) => tokio::time::timeout(timeout, rx).await??,
-            None => rx.await?,
-        };
         match reply {
             Ok(val) => Ok(<A::Reply as Reply>::downcast_ok(val)),
             Err(err) => Err(<A::Reply as Reply>::downcast_err(err)),
